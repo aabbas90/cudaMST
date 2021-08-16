@@ -4,8 +4,9 @@
 
 #include "graph.cuh"
 #include "gettime.h"
-#include "MST.h"
-#include "parallel.h"
+// #include "MST.h"
+// #include "parallel.h"
+#include <thrust/gather.h>
 #include <thrust/device_vector.h>
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
@@ -17,11 +18,13 @@ const int BlockSize = 256;
 
 using namespace std;
 
+namespace MST_kruskal
+{
 __global__
-void init_Edges(wghEdge<intT> *input, intT size, intT *u, intT *v, double *w, intT *id) {
+void init_Edges(wghEdge<int> *input, int size, int *u, int *v, float *w, int *id) {
   const int pos = threadIdx.x + blockIdx.x * blockDim.x;
   if (pos < size) {
-    wghEdge<intT> e = input[pos];
+    wghEdge<int> e = input[pos];
     u[pos] = e.u;
     v[pos] = e.v;
     w[pos] = e.weight;
@@ -35,54 +38,69 @@ void init_Edges(wghEdge<intT> *input, intT size, intT *u, intT *v, double *w, in
 }
 
 struct UndirectedEdges {
-  thrust::device_vector<intT> s;
-  thrust::device_vector<intT> t;
-  thrust::device_vector<intT> id; // this stores the id marked after split_graph
+  thrust::device_vector<int> s;
+  thrust::device_vector<int> t;
+  thrust::device_vector<int> id; // this stores the id marked after split_graph
   thrust::device_vector<float> w;
-  thrust::device_vector<intT> result_id; // this stores the id for final result (the original id in the input file)
+  thrust::device_vector<int> result_id; // this stores the id for final result (the original id in the input file)
 
-  intT n_edges;
-  intT n_vertices;
+  int n_edges;
+  int n_vertices;
 
   struct init_operator {
-    typedef thrust::tuple<intT, intT, intT, float> Tuple;
+    typedef thrust::tuple<int, int, int, float> Tuple;
 
     __host__ __device__
-    Tuple operator() (const wghEdge<intT>& edge, const intT idx) {
+    Tuple operator() (const wghEdge<int>& edge, const int idx) {
       return thrust::make_tuple(edge.u, edge.v, idx, edge.weight);
     }
   };
 
   UndirectedEdges() {}
 
-  UndirectedEdges(intT m, intT n) : 
+  UndirectedEdges(int m, int n) : 
     s(m), t(m), id(m), w(m), result_id(m), n_edges(m), n_vertices(n) {}
 
-  UndirectedEdges(const wghEdgeArray<intT>& G):
+  UndirectedEdges(const wghEdgeArray<int>& G):
     s(G.m), t(G.m), id(G.m), w(G.m), result_id(G.m), n_edges(G.m), n_vertices(G.n) { 
-    thrust::device_vector<wghEdge<intT>> E(G.E, G.E + G.m);
+    thrust::device_vector<wghEdge<int>> E(G.E, G.E + G.m);
     thrust::transform(
         E.begin(), E.end(), thrust::make_counting_iterator(0), 
         thrust::make_zip_iterator(thrust::make_tuple(
             s.begin(), t.begin(), result_id.begin(), w.begin())),
         init_operator());
   }
+
+  UndirectedEdges(const thrust::device_vector<int>& _u, const thrust::device_vector<int>& _v, const thrust::device_vector<float>& _w) 
+  {
+    assert(_u.size() == _v.size());
+    assert(_u.size() == _w.size());
+    s = thrust::device_vector<int>(_u.begin(), _u.end());
+    t = thrust::device_vector<int>(_v.begin(), _v.end());
+    w = thrust::device_vector<int>(_w.begin(), _w.end());
+    id = thrust::device_vector<int>(_u.size());
+    result_id = thrust::device_vector<int>(_u.size());
+    thrust::sequence(result_id.begin(), result_id.end());
+    n_edges = _u.size();
+    n_vertices = *thrust::max_element(s.begin(), s.end()) + 1;
+    assert(n_vertices == *thrust::max_element(t.begin(), t.end()) + 1); // should be undirected graph.
+  }
 };
 
 struct Edges {
-  thrust::device_vector<intT> u;
-  thrust::device_vector<intT> v;
-  thrust::device_vector<intT> id;
-  thrust::device_vector<double> w;
+  thrust::device_vector<int> u;
+  thrust::device_vector<int> v;
+  thrust::device_vector<int> id;
+  thrust::device_vector<float> w;
 
-  intT n_edges;
-  intT n_vertices;
+  int n_edges;
+  int n_vertices;
 
   Edges() { }
 
-  Edges(const wghEdgeArray<intT>& G) :
+  Edges(const wghEdgeArray<int>& G) :
     u(G.m*2), v(G.m*2), id(G.m*2), w(G.m*2), n_edges(G.m*2), n_vertices(G.n) { 
-    thrust::device_vector<wghEdge<intT>> E(G.E, G.E + G.m);
+    thrust::device_vector<wghEdge<int>> E(G.E, G.E + G.m);
 
     init_Edges<<<(G.m + BlockSize - 1) / BlockSize, BlockSize>>>
       (thrust::raw_pointer_cast(E.data()), G.m, 
@@ -92,7 +110,7 @@ struct Edges {
        thrust::raw_pointer_cast(id.data()));
   }
 
-  Edges(intT m, intT n) : u(m), v(m), id(m), w(m), n_edges(m), n_vertices(n) { }
+  Edges(int m, int n) : u(m), v(m), id(m), w(m), n_edges(m), n_vertices(n) { }
 };
 
 
@@ -109,12 +127,12 @@ void print_vector(const T& vec, string text, uint32_t size=100) {
 // kernels for mst
 //--------------------------------------------------------------------------------
 __global__
-void remove_circles(intT *input, size_t size, intT* id, intT* output, intT *aux)
+void remove_circles(int *input, size_t size, int* id, int* output, int *aux)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
   if (pos < size) {
-    intT successor   = input[pos];
-    intT s_successor = input[successor];
+    int successor   = input[pos];
+    int s_successor = input[successor];
 
     successor = ((successor > pos) && (s_successor == pos)) ? pos : successor;
     //if ((successor > pos) && (s_successor == pos)) {
@@ -128,7 +146,7 @@ void remove_circles(intT *input, size_t size, intT* id, intT* output, intT *aux)
 }
 
 __global__
-void merge_vertices(intT *successors, size_t size)
+void merge_vertices(int *successors, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -137,8 +155,8 @@ void merge_vertices(intT *successors, size_t size)
     int i = 0;
 
     while (goon && (i++ < 50)) {
-      intT successor = successors[pos];
-      intT ssuccessor= successors[successor];
+      int successor = successors[pos];
+      int ssuccessor= successors[successor];
       __syncthreads();
 
       if (ssuccessor != successor) {
@@ -151,7 +169,7 @@ void merge_vertices(intT *successors, size_t size)
 }
 
 __global__
-void mark_segments(intT *input, intT *output, size_t size)
+void mark_segments(int *input, int *output, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -162,8 +180,8 @@ void mark_segments(intT *input, intT *output, size_t size)
 
 __global__
 void mark_edges_to_keep(
-    const intT *u, const intT *v,
-    const intT *new_vertices, intT *output, size_t size)
+    const int *u, const int *v,
+    const int *new_vertices, int *output, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -175,7 +193,7 @@ void mark_edges_to_keep(
 
 __global__
 void update_edges_with_new_vertices(
-    intT *u, intT *v, intT *new_vertices, size_t size)
+    int *u, int *v, int *new_vertices, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -193,7 +211,7 @@ __host__ __device__ bool operator< (const int2& a, const int2& b) {
 };
 
 struct binop_tuple_minimum {
-  typedef thrust::tuple<double, intT, intT> T; // (w, v, id)
+  typedef thrust::tuple<float, int, int> T; // (w, v, id)
   __host__ __device__ 
   T operator() (const T& a, const T& b) const {
     return (thrust::get<0>(a) == thrust::get<0>(b)) ? 
@@ -237,7 +255,7 @@ vector<pair<uint32_t, uint32_t>> split_graph(UndirectedEdges& edges)
 void contract_and_build_subgraph(
     uint32_t begin, uint32_t end, 
     UndirectedEdges& edges, 
-    const thrust::device_vector<intT>& supervertices,
+    const thrust::device_vector<int>& supervertices,
     Edges& output)
 {
   uint32_t size = end - begin;
@@ -250,8 +268,8 @@ void contract_and_build_subgraph(
       edges.t.begin()+begin);
 
   // build subgraph in directed edge list style
-  thrust::device_vector<intT> flags(size, 0); 
-  thrust::device_vector<intT> indices(size); 
+  thrust::device_vector<int> flags(size, 0); 
+  thrust::device_vector<int> indices(size); 
 
   mark_edges_to_keep<<<(size + BlockSize - 1) / BlockSize, BlockSize>>>
     (thrust::raw_pointer_cast(edges.s.data()) + begin,
@@ -290,9 +308,9 @@ void contract_and_build_subgraph(
 
 void boruvka_mst(
     Edges& edges,
-    thrust::device_vector<intT>& supervertices,
-    thrust::device_vector<intT>& mst_edges,
-    intT &n_mst)
+    thrust::device_vector<int>& supervertices,
+    thrust::device_vector<int>& mst_edges,
+    int &n_mst)
 {
   if (!edges.n_edges) return;
 
@@ -301,9 +319,9 @@ void boruvka_mst(
   size_t n_edges = edges.n_edges;
   size_t n_vertices = edges.n_vertices;
 
-  thrust::device_vector<intT> succ_id(n_vertices);
-  thrust::device_vector<intT> succ_indices(n_vertices);
-  thrust::device_vector<intT> succ_temp(n_vertices);
+  thrust::device_vector<int> succ_id(n_vertices);
+  thrust::device_vector<int> succ_indices(n_vertices);
+  thrust::device_vector<int> succ_temp(n_vertices);
 
   thrust::device_vector<int>  indices(n_edges);
   thrust::device_vector<int>  flags(n_edges);
@@ -336,7 +354,7 @@ void boruvka_mst(
         edges_temp.u.begin(),
         thrust::make_zip_iterator(thrust::make_tuple(
             edges_temp.w.begin(), edges_temp.v.begin(), edges_temp.id.begin())),
-        thrust::equal_to<intT>(),
+        thrust::equal_to<int>(),
         binop_tuple_minimum());
 
     size_t n_min_edges = new_last.first - edges_temp.u.begin();
@@ -384,7 +402,7 @@ void boruvka_mst(
     thrust::exclusive_scan(flags.begin(), flags.begin() + n_edges, 
         indices.begin());
 
-    intT new_edge_size = indices[n_edges-1] + flags[n_edges-1];
+    int new_edge_size = indices[n_edges-1] + flags[n_edges-1];
     if (!new_edge_size) { return; }
 
     thrust::scatter_if(
@@ -415,7 +433,7 @@ void boruvka_mst(
 //--------------------------------------------------------------------------------
 // top level mst
 //--------------------------------------------------------------------------------
-std::pair<intT*,intT> mst(wghEdgeArray<intT> G)
+std::pair<int*,int> mst(wghEdgeArray<int> G)
 {
   startTime();
 
@@ -426,9 +444,9 @@ std::pair<intT*,intT> mst(wghEdgeArray<intT> G)
   Edges subgraph;
   subgraph.n_vertices = G.n;
 
-  thrust::device_vector<intT> supervertices(G.n);
-  thrust::device_vector<intT> mst_edges(G.m);
-  intT n_mst = 0;
+  thrust::device_vector<int> supervertices(G.n);
+  thrust::device_vector<int> mst_edges(G.m);
+  int n_mst = 0;
 
   thrust::sequence(supervertices.begin(), supervertices.end());
 
@@ -448,9 +466,48 @@ std::pair<intT*,intT> mst(wghEdgeArray<intT> G)
   thrust::gather(mst_edges.begin(), mst_edges.begin() + n_mst,
       edges.result_id.begin(), edges.id.begin());
 
-  intT *result_mst_edges = new intT[n_mst];
+  int *result_mst_edges = new int[n_mst];
   thrust::copy(edges.id.begin(), edges.id.begin() + n_mst, result_mst_edges);
 
   return make_pair(result_mst_edges, n_mst);
 }
 
+thrust::device_vector<int> maximum_spanning_tree(const thrust::device_vector<int>& i, const thrust::device_vector<int>& j, const thrust::device_vector<float>& neg_costs)
+{
+  UndirectedEdges edges(i, j, neg_costs);
+
+  // Invert costs to find maximum spanning tree.
+  thrust::transform(edges.w.begin(), edges.w.end(), edges.w.begin(), thrust::negate<float>());
+  
+  Edges subgraph;
+  subgraph.n_vertices = edges.n_vertices;
+
+  thrust::device_vector<int> supervertices(edges.n_vertices);
+  thrust::device_vector<int> mst_edges(edges.n_edges);
+  int n_mst = 0;
+
+  thrust::sequence(supervertices.begin(), supervertices.end());
+
+  auto split_indices = split_graph(edges);
+  for (auto it = split_indices.begin(); ; ) {
+    contract_and_build_subgraph(
+        it->first, it->second, edges, supervertices, 
+        subgraph);
+
+    // this step, contrary to the paper, also includes connect components, by update the global super vertices
+    boruvka_mst(subgraph, supervertices, mst_edges, n_mst);
+
+    if (split_indices.end() == (++it)) break;
+  }
+
+  // fetch result ids, stored to edges.id temporarily
+  thrust::gather(mst_edges.begin(), mst_edges.begin() + n_mst,
+      edges.result_id.begin(), edges.id.begin());
+
+  edges.id.resize(n_mst);
+  // int *result_mst_edges = new int[n_mst];
+  // thrust::copy(edges.id.begin(), edges.id.begin() + n_mst, result_mst_edges);
+
+  return edges.id;
+}
+}

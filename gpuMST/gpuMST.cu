@@ -4,23 +4,27 @@
 
 #include "graph.cuh"
 #include "gettime.h"
-#include "MST.h"
-#include "parallel.h"
-#include <thrust/device_vector.h>
+#include "gpuMST.h"
+// #include "MST.h"
+// #include "parallel.h"
+#include <cuda_runtime.h>
+#include <thrust/copy.h>
+#include <thrust/gather.h>
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/constant_iterator.h>
+#include <thrust/sequence.h>
 
 const int BlockSize = 256;
 
-using namespace std;
-
+namespace MST_boruvka
+{
 __global__
-void init_Edges(wghEdge<intT> *input, intT size, intT *u, intT *v, double *w, intT *id) {
+void init_Edges(wghEdge<int> *input, int size, int *u, int *v, float *w, int *id) {
   const int pos = threadIdx.x + blockIdx.x * blockDim.x;
   if (pos < size) {
-    wghEdge<intT> e = input[pos];
+    wghEdge<int> e = input[pos];
     u[pos] = e.u;
     v[pos] = e.v;
     w[pos] = e.weight;
@@ -35,19 +39,43 @@ void init_Edges(wghEdge<intT> *input, intT size, intT *u, intT *v, double *w, in
 
 
 struct Edges {
-  thrust::device_vector<intT> u;
-  thrust::device_vector<intT> v;
-  thrust::device_vector<intT> id;
-  thrust::device_vector<double> w;
+  thrust::device_vector<int> u;
+  thrust::device_vector<int> v;
+  thrust::device_vector<int> id;
+  thrust::device_vector<float> w;
 
-  intT n_edges;
-  intT n_vertices;
+  int n_edges = 0;
+  int n_vertices = 0;
 
   Edges() { }
 
-  Edges(const wghEdgeArray<intT>& G) :
+  Edges(const thrust::device_vector<int>& _u, const thrust::device_vector<int>& _v, const thrust::device_vector<float>& _costs) :
+  u(2 * _u.size()), v(2 * _v.size()), id(2 * _u.size()), w(2 * _costs.size()), n_edges(2 * _costs.size())
+  {
+    assert(_u.size() == _v.size());
+    assert(_u.size() == _costs.size());
+
+    thrust::copy(_u.begin(), _u.end(), u.begin());
+    thrust::copy(_u.begin(), _u.end(), v.begin() + _u.size());
+
+    thrust::copy(_v.begin(), _v.end(), v.begin());
+    thrust::copy(_v.begin(), _v.end(), u.begin() + _v.size());
+
+    thrust::copy(_costs.begin(), _costs.end(), w.begin());
+    thrust::copy(_costs.begin(), _costs.end(), w.begin() + _costs.size());
+
+    n_edges = w.size();
+    id = thrust::device_vector<int>(n_edges);
+    thrust::sequence(id.begin(), id.begin() + _costs.size());
+    thrust::sequence(id.begin() + _costs.size(), id.end());
+
+    n_vertices = *thrust::max_element(u.begin(), u.end()) + 1;
+    assert(n_vertices == *thrust::max_element(v.begin(), v.end()) + 1); // should be undirected graph.
+  }
+
+  Edges(const wghEdgeArray<int>& G) :
     u(G.m*2), v(G.m*2), id(G.m*2), w(G.m*2), n_edges(G.m*2), n_vertices(G.n) { 
-    thrust::device_vector<wghEdge<intT>> E(G.E, G.E + G.m);
+    thrust::device_vector<wghEdge<int>> E(G.E, G.E + G.m);
 
     init_Edges<<<(G.m + BlockSize - 1) / BlockSize, BlockSize>>>
       (thrust::raw_pointer_cast(E.data()), G.m, 
@@ -57,29 +85,29 @@ struct Edges {
        thrust::raw_pointer_cast(id.data()));
   }
 
-  Edges(intT m, intT n) : u(m), v(m), id(m), w(m), n_edges(m), n_vertices(n) { }
+  Edges(int m, int n) : u(m), v(m), id(m), w(m), n_edges(m), n_vertices(n) { }
 };
 
 
 template<typename T>
-void print_vector(const T& vec, string text) {
-  cout << text << endl;
+void print_vector(const T& vec, std::string text) {
+  std::cout << text << std::endl;
   for (size_t i = 0; i < vec.size() && i < 100; ++i) {
-    cout << " " << vec[i];
+    std::cout << " " << vec[i];
   }
-  cout << endl;
+  std::cout << std::endl;
 }
 
 //--------------------------------------------------------------------------------
 // kernels for mst
 //--------------------------------------------------------------------------------
 __global__
-void remove_circles(intT *input, size_t size, intT* output, intT *aux)
+void remove_circles(int *input, size_t size, int* output, int *aux)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
   if (pos < size) {
-    intT successor   = input[pos];
-    intT s_successor = input[successor];
+    int successor   = input[pos];
+    int s_successor = input[successor];
 
     successor = ((successor > pos) && (s_successor == pos)) ? pos : successor;
     //if ((successor > pos) && (s_successor == pos)) {
@@ -91,7 +119,7 @@ void remove_circles(intT *input, size_t size, intT* output, intT *aux)
 }
 
 __global__
-void merge_vertices(intT *successors, size_t size)
+void merge_vertices(int *successors, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -100,8 +128,8 @@ void merge_vertices(intT *successors, size_t size)
     int i = 0;
 
     while (goon && (i++ < 50)) {
-      intT successor = successors[pos];
-      intT ssuccessor= successors[successor];
+      int successor = successors[pos];
+      int ssuccessor= successors[successor];
       __syncthreads();
 
       if (ssuccessor != successor) {
@@ -114,7 +142,7 @@ void merge_vertices(intT *successors, size_t size)
 }
 
 __global__
-void mark_segments(intT *input, intT *output, size_t size)
+void mark_segments(int *input, int *output, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -125,8 +153,8 @@ void mark_segments(intT *input, intT *output, size_t size)
 
 __global__
 void mark_edges_to_keep(
-    const intT *u, const intT *v,
-    intT *new_vertices, intT *output, size_t size)
+    const int *u, const int *v,
+    int *new_vertices, int *output, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -138,7 +166,7 @@ void mark_edges_to_keep(
 
 __global__
 void update_edges_with_new_vertices(
-    intT *u, intT *v, intT *new_vertices, size_t size)
+    int *u, int *v, int *new_vertices, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -156,7 +184,7 @@ __host__ __device__ bool operator< (const int2& a, const int2& b) {
 };
 
 struct binop_tuple_minimum {
-  typedef thrust::tuple<double, intT, intT> T; // (w, v, id)
+  typedef thrust::tuple<float, int, int> T; // (w, v, id)
   __host__ __device__ 
   T operator() (const T& a, const T& b) const {
     return (thrust::get<0>(a) == thrust::get<0>(b)) ? 
@@ -165,21 +193,21 @@ struct binop_tuple_minimum {
   }
 };
 
-//--------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------
 // GPU MST
-//--------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------
 void recursive_mst_loop(
     Edges& edges,
-    thrust::device_vector<intT>&    mst_edges,
-    intT &n_mst)
+    thrust::device_vector<int>&    mst_edges,
+    int &n_mst)
 {
   size_t n_edges = edges.n_edges;
   size_t n_vertices = edges.n_vertices;
 
-  thrust::device_vector<intT> succ(n_vertices);
-  thrust::device_vector<intT> succ_id(n_vertices);
-  thrust::device_vector<intT> succ_indices(n_vertices);
-  thrust::device_vector<intT> succ_temp(n_vertices);
+  thrust::device_vector<int> succ(n_vertices);
+  thrust::device_vector<int> succ_id(n_vertices);
+  thrust::device_vector<int> succ_indices(n_vertices);
+  thrust::device_vector<int> succ_temp(n_vertices);
 
   thrust::device_vector<int>  indices(n_edges);
   thrust::device_vector<int>  flags(n_edges);
@@ -211,12 +239,12 @@ void recursive_mst_loop(
         edges_temp.u.begin(),
         thrust::make_zip_iterator(thrust::make_tuple(
             edges_temp.w.begin(), edges_temp.v.begin(), edges_temp.id.begin())),
-        thrust::equal_to<intT>(),
+        thrust::equal_to<int>(),
         binop_tuple_minimum());
 
     size_t n_min_edges = new_last.first - edges_temp.u.begin();
 
-    //cout << "n_min_edges: " << n_min_edges << endl;
+    //std::cout << "n_min_edges: " << n_min_edges << endl;
 
     thrust::sequence(succ_indices.begin(), succ_indices.begin() + n_vertices);
     thrust::scatter(
@@ -242,7 +270,7 @@ void recursive_mst_loop(
 
     n_mst += succ_indices[n_vertices-1] + succ_temp[n_vertices-1];
 
-    //cout << "n_mst: " << n_mst << endl;
+    //std::cout << "n_mst: " << n_mst << endl;
 
     // generating super vertices (new vertices)
     thrust::sequence(succ_indices.begin(), succ_indices.begin() + n_vertices);
@@ -256,15 +284,15 @@ void recursive_mst_loop(
        thrust::raw_pointer_cast(succ_temp.data()), n_vertices);
 
     // new_vertices stored for subsequent calls to do query about next-vertice id
-    thrust::device_vector<intT>& new_vertices = succ;
+    thrust::device_vector<int>& new_vertices = succ;
     thrust::exclusive_scan(succ_temp.begin(), succ_temp.begin() + n_vertices, 
         succ_id.begin());
     thrust::scatter(succ_id.begin(), succ_id.begin() + n_vertices, 
         succ_indices.begin(), new_vertices.begin());
 
-    intT new_vertice_size = succ_id[n_vertices-1] + succ_temp[n_vertices-1];
+    int new_vertice_size = succ_id[n_vertices-1] + succ_temp[n_vertices-1];
 
-    //cout << "new_vertice_size: " << new_vertice_size << endl;
+    //std::cout << "new_vertice_size: " << new_vertice_size << endl;
 
     // generating new edges
     mark_edges_to_keep<<<(n_edges + BlockSize - 1) / BlockSize, BlockSize>>>
@@ -275,10 +303,10 @@ void recursive_mst_loop(
     thrust::exclusive_scan(flags.begin(), flags.begin() + n_edges, 
         indices.begin());
 
-    intT new_edge_size = indices[n_edges-1] + flags[n_edges-1];
+    int new_edge_size = indices[n_edges-1] + flags[n_edges-1];
     if (!new_edge_size) { return; }
 
-    //cout << "new_edge_size: " << new_edge_size << endl;
+    //std::cout << "new_edge_size: " << new_edge_size << endl;
 
     thrust::scatter_if(
         thrust::make_zip_iterator(thrust::make_tuple(
@@ -308,22 +336,49 @@ void recursive_mst_loop(
 //--------------------------------------------------------------------------------
 // top level mst
 //--------------------------------------------------------------------------------
-std::pair<intT*,intT> mst(wghEdgeArray<intT> G)
+std::pair<int*,int> mst(wghEdgeArray<int> G)
 {
   startTime();
 
   Edges edges(G);
-  thrust::device_vector<intT> mst_edges(G.m);
+  thrust::device_vector<int> mst_edges(G.m);
 
   nextTime("prepare graph");
 
-  intT mst_size = 0;
+  int mst_size = 0;
   recursive_mst_loop(edges, mst_edges, mst_size);
 
-  intT *result_mst_edges = new intT[mst_size];
+  int *result_mst_edges = new int[mst_size];
   cudaMemcpy(result_mst_edges, thrust::raw_pointer_cast(mst_edges.data()),
-      sizeof(intT) * mst_size, cudaMemcpyDeviceToHost);
+      sizeof(int) * mst_size, cudaMemcpyDeviceToHost);
 
-  return make_pair(result_mst_edges, mst_size);
+  return std::make_pair(result_mst_edges, mst_size);
 }
 
+// Input should be directed graph.
+std::tuple<thrust::device_vector<int>, thrust::device_vector<int>, thrust::device_vector<float>> maximum_spanning_tree(const thrust::device_vector<int>& i, const thrust::device_vector<int>& j, const thrust::device_vector<float>& neg_costs)
+{
+  Edges edges(i, j, neg_costs);
+  thrust::device_vector<int> mst_edges(edges.n_edges);
+
+  // Invert costs to find maximum spanning tree.
+  thrust::transform(edges.w.begin(), edges.w.end(), edges.w.begin(), thrust::negate<float>());
+  
+  int mst_size = 0;
+  recursive_mst_loop(edges, mst_edges, mst_size);
+  
+  thrust::sort(mst_edges.begin(), mst_edges.begin() + mst_size);
+  auto last_unique = thrust::unique(mst_edges.begin(), mst_edges.begin() + mst_size);
+  mst_edges.resize(std::distance(mst_edges.begin(), last_unique));
+
+  thrust::device_vector<int> mst_i(mst_edges.size());
+  thrust::device_vector<int> mst_j(mst_edges.size());
+  thrust::device_vector<float> mst_values(mst_edges.size());
+  
+  thrust::gather(mst_edges.begin(), mst_edges.end(), i.begin(), mst_i.begin());
+  thrust::gather(mst_edges.begin(), mst_edges.end(), j.begin(), mst_j.begin());
+  thrust::gather(mst_edges.begin(), mst_edges.end(), neg_costs.begin(), mst_values.begin());
+
+  return {mst_i, mst_j, mst_values};
+}
+}
